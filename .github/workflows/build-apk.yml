@@ -18,12 +18,15 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Unpack Android source project
+        shell: bash
         run: |
-          mkdir android-project
-          unzip PakGSM_Bluetooth_Test_Android_Source.zip -d android-project
-          find android-project -maxdepth 3 -type f | head -80
+          set -e
+          mkdir -p android-project
+          unzip -o PakGSM_Bluetooth_Test_Android_Source.zip -d android-project
+          echo "Project files:"
+          find android-project -maxdepth 4 -type f | head -100
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -36,6 +39,69 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
+      - name: Fix Java/Kotlin JVM target mismatch
+        working-directory: android-project
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRADLE_FILE="app/build.gradle.kts"
+
+          if [ ! -f "$GRADLE_FILE" ]; then
+            echo "::error::Could not find $GRADLE_FILE. Check the Android ZIP folder structure."
+            find . -name 'build.gradle*' -type f
+            exit 1
+          fi
+
+          echo "Before fix, relevant settings:"
+          grep -nE 'sourceCompatibility|targetCompatibility|jvmTarget|VERSION_1_8|VERSION_17' "$GRADLE_FILE" || true
+
+          # The build log showed Java targeting 1.8 while Kotlin targets JVM 17.
+          # Align Java compile options to Java 17 in the app module.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          p = Path("app/build.gradle.kts")
+          s = p.read_text(encoding="utf-8")
+          original = s
+
+          # Replace common Java 8 target declarations.
+          s = re.sub(r'(?m)(sourceCompatibility\s*=\s*JavaVersion\.)VERSION_1_8', r'\1VERSION_17', s)
+          s = re.sub(r'(?m)(targetCompatibility\s*=\s*JavaVersion\.)VERSION_1_8', r'\1VERSION_17', s)
+
+          # Also handle JavaVersion.VERSION_1_8 in compact or spaced forms.
+          if s == original and ("sourceCompatibility" in s or "targetCompatibility" in s):
+              s = re.sub(r'(?m)(sourceCompatibility\s*=\s*)JavaVersion\.VERSION_1_8', r'\1JavaVersion.VERSION_17', s)
+              s = re.sub(r'(?m)(targetCompatibility\s*=\s*)JavaVersion\.VERSION_1_8', r'\1JavaVersion.VERSION_17', s)
+
+          if s == original:
+              # If compileOptions exists but uses another spelling, show the file and stop safely
+              # rather than silently building with mismatched targets.
+              if "compileOptions" in s:
+                  print("Could not safely identify Java 1.8 declarations to update.", file=sys.stderr)
+                  print(s, file=sys.stderr)
+                  sys.exit(2)
+              # Add compileOptions inside the android block when it is absent.
+              m = re.search(r'(?m)^android\s*\{', s)
+              if not m:
+                  print("Could not find the android { } block in app/build.gradle.kts.", file=sys.stderr)
+                  print(s, file=sys.stderr)
+                  sys.exit(3)
+              insert_at = m.end()
+              s = s[:insert_at] + '''
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          ''' + s[insert_at:]
+
+          p.write_text(s, encoding="utf-8")
+          print("Updated app/build.gradle.kts to use Java 17.")
+          PY
+
+          echo "After fix, relevant settings:"
+          grep -nE 'sourceCompatibility|targetCompatibility|jvmTarget|VERSION_1_8|VERSION_17' "$GRADLE_FILE" || true
 
       - name: Build debug APK
         working-directory: android-project
